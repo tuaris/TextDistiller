@@ -1,0 +1,180 @@
+#!/usr/bin/env php
+<?php
+/**
+ * TextDistiller CLI - Feed text in, get deterministic classification + extracted facts out.
+ *
+ * Usage:
+ *   echo "some observation text" | ./bin/distill
+ *   ./bin/distill "inline text argument"
+ *   ./bin/distill --file /path/to/file.txt
+ *   ./bin/distill --json                    (output as JSON instead of human-readable)
+ *   ./bin/distill --verbose                 (show scoring details)
+ *
+ * @package    TextDistiller
+ * @author     Daniel Morante
+ * @copyright  2026 The Daniel Morante Company, Inc.
+ * @license    BSD-3-Clause
+ */
+
+// Autoload the library
+spl_autoload_register(function ($class) {
+    $prefix = 'TextDistiller\\';
+    if (strpos($class, $prefix) !== 0) return;
+    $relative = substr($class, strlen($prefix));
+    $relative = str_replace('\\', '/', $relative);
+    $classFile = __DIR__ . '/../src/' . $relative . '.class.php';
+    if (is_file($classFile)) { require_once $classFile; return; }
+    $ifaceFile = __DIR__ . '/../src/' . $relative . '.interface.php';
+    if (is_file($ifaceFile)) { require_once $ifaceFile; return; }
+});
+
+use TextDistiller\Distiller;
+
+// --- Parse arguments ---
+$args = $argv;
+array_shift($args); // Remove script name
+
+$jsonOutput = false;
+$verbose = false;
+$file = null;
+$corpusFile = null;
+$inlineText = [];
+
+while ($arg = array_shift($args)) {
+    switch ($arg) {
+        case '--json':
+        case '-j':
+            $jsonOutput = true;
+            break;
+        case '--verbose':
+        case '-v':
+            $verbose = true;
+            break;
+        case '--file':
+        case '-f':
+            $file = array_shift($args);
+            break;
+        case '--corpus':
+        case '-c':
+            $corpusFile = array_shift($args);
+            break;
+        case '--help':
+        case '-h':
+            fwrite(STDOUT, <<<HELP
+TextDistiller - Deterministic text compression engine (TF-IDF + LexRank)
+
+Usage:
+  echo "text" | distill           Read from stdin
+  distill "inline text"           Pass as argument
+  distill --file input.txt        Read from file
+  distill --corpus bg.txt         Background corpus (one observation per line, for TF-IDF context)
+  distill --json                  Output as JSON
+  distill --verbose               Show scoring details (novelty/centrality/entity breakdown)
+
+Actions:
+  archive   - Structured content, keep verbatim
+  prune     - Session narrative, discard
+  compress  - Factual content, extracted facts listed
+
+Scoring (fused, domain-agnostic):
+  40% TF-IDF novelty   — terms rare in the corpus score higher
+  30% LexRank centrality — sentences central to the observation's meaning
+  30% Entity signal      — proper nouns, numbers, paths, identifiers
+
+HELP);
+            exit(0);
+        default:
+            $inlineText[] = $arg;
+    }
+}
+
+// --- Get input text ---
+$content = '';
+
+if ($file !== null) {
+    if (!is_file($file)) {
+        fwrite(STDERR, "Error: File not found: {$file}\n");
+        exit(1);
+    }
+    $content = file_get_contents($file);
+} elseif (!empty($inlineText)) {
+    $content = implode(' ', $inlineText);
+} elseif (!posix_isatty(STDIN)) {
+    $content = stream_get_contents(STDIN);
+} else {
+    fwrite(STDERR, "Error: No input. Provide text via stdin, argument, or --file.\n");
+    fwrite(STDERR, "Try: distill --help\n");
+    exit(1);
+}
+
+$content = trim($content);
+if ($content === '') {
+    fwrite(STDERR, "Error: Empty input.\n");
+    exit(1);
+}
+
+// --- Load background corpus (if provided) ---
+$backgroundCorpus = [];
+if ($corpusFile !== null) {
+    if (!is_file($corpusFile)) {
+        fwrite(STDERR, "Error: Corpus file not found: {$corpusFile}\n");
+        exit(1);
+    }
+    $corpusContent = file_get_contents($corpusFile);
+    $backgroundCorpus = array_filter(
+        array_map('trim', explode("\n", $corpusContent)),
+        fn($line) => $line !== ''
+    );
+}
+
+// --- Run distillation ---
+$distiller = new Distiller();
+$result = $distiller->distill($content, '', $backgroundCorpus);
+
+// --- Output ---
+if ($jsonOutput) {
+    echo json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+    exit(0);
+}
+
+// Human-readable output
+$actionColors = [
+    'archive' => "\033[34m",   // Blue
+    'prune'   => "\033[33m",   // Yellow
+    'compress' => "\033[32m",  // Green
+];
+$reset = "\033[0m";
+$color = $actionColors[$result['action']] ?? '';
+
+echo "{$color}■ {$result['action']}{$reset} — {$result['reason']}\n";
+
+if (!empty($result['facts'])) {
+    echo "\nExtracted facts:\n";
+    foreach ($result['facts'] as $i => $fact) {
+        if ($verbose && isset($result['metadata']['scoring_detail'][$i])) {
+            $detail = $result['metadata']['scoring_detail'][$i];
+            $breakdown = sprintf("[%.2f = N:%.2f C:%.2f E:%.2f]",
+                $detail['fused'], $detail['novelty'], $detail['centrality'], $detail['entity']);
+            echo "  {$breakdown} {$fact}\n";
+        } elseif ($verbose) {
+            $score = $result['metadata']['scores'][$i] ?? '?';
+            echo "  [{$score}] {$fact}\n";
+        } else {
+            echo "  • {$fact}\n";
+        }
+    }
+}
+
+if ($verbose) {
+    echo "\nMetadata:\n";
+    echo "  Input length: {$result['metadata']['input_length']} chars\n";
+    if (isset($result['metadata']['sentences_found'])) {
+        echo "  Sentences found: {$result['metadata']['sentences_found']}\n";
+        echo "  Sentences kept: {$result['metadata']['sentences_kept']}\n";
+    }
+    if (!empty($backgroundCorpus)) {
+        echo "  Background corpus: " . count($backgroundCorpus) . " observations\n";
+    }
+}
+
+exit(0);
