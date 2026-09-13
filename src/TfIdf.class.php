@@ -78,7 +78,9 @@ class TfIdf
     /**
      * Tokenize a string into normalized terms using IntlBreakIterator.
      *
-     * Preserves technical tokens (paths, versions, IPs) as single terms.
+     * ICU word-breaking keeps version strings and IPs (2.4.1, 10.0.0.1)
+     * as single terms, but splits on '/' and '-': paths and hyphenated
+     * names become multiple terms (src/io.zig → src, io.zig).
      * Applies language-specific normalization via the LanguageProvider.
      *
      * @param  string $text
@@ -125,11 +127,17 @@ class TfIdf
     {
         $word = mb_strtolower($word);
 
-        // Strip trailing punctuation
-        $word = rtrim($word, '.,;:!?()[]{}"\'/');
+        // Strip leading/trailing Unicode punctuation and symbols. rtrim's
+        // byte-wise character list cannot handle multi-byte codepoints, so
+        // a typographic apostrophe (U+2019) would survive and split the
+        // vocabulary (porter’ ≠ porter).
+        $word = (string) preg_replace('/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/u', '', $word);
 
-        // Delegate to language provider for morphological normalization
-        return $this->language->normalize($word);
+        // Delegate to language provider for morphological normalization.
+        // Suffix stripping can expose punctuation again (porter’s → porter’),
+        // so strip once more afterwards.
+        $word = $this->language->normalize($word);
+        return (string) preg_replace('/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/u', '', $word);
     }
 
     /**
